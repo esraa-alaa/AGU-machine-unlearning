@@ -1,0 +1,148 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torchtext.datasets import IMDB
+from torchtext.data.utils import get_tokenizer
+from torchtext.vocab import build_vocab_from_iterator
+from torch.utils.data import DataLoader
+from torch.nn.utils.rnn import pad_sequence
+
+# Define an LSTM model for sentiment analysis
+class SentimentLSTM(nn.Module):
+    def __init__(self, vocab_size, embed_dim, hidden_dim, output_dim):
+        super(SentimentLSTM, self).__init__()
+        self.embedding = nn.Embedding(vocab_size, embed_dim)
+        self.lstm = nn.LSTM(embed_dim, hidden_dim, batch_first=True)
+        self.fc = nn.Linear(hidden_dim, output_dim)
+
+    def forward(self, x):
+        x = self.embedding(x)
+        _, (hidden, _) = self.lstm(x)
+        return self.fc(hidden[-1])
+
+# Preprocessing functions
+tokenizer = get_tokenizer("basic_english")
+
+def yield_tokens(data_iter):
+    for _, text in data_iter:
+        yield tokenizer(text)
+
+# Prepare the IMDB dataset
+train_iter, test_iter = IMDB(split=('train', 'test'))
+
+# Build vocabulary
+vocab = build_vocab_from_iterator(yield_tokens(train_iter), specials=["<unk>"])
+vocab.set_default_index(vocab["<unk>"])
+
+def process_data(text, label):
+    text = torch.tensor(vocab(tokenizer(text)), dtype=torch.long)
+    label = torch.tensor(1 if label == "pos" else 0, dtype=torch.long)
+    return text, label
+
+def collate_batch(batch):
+    texts, labels = zip(*batch)
+    texts = pad_sequence(texts, batch_first=True, padding_value=0)
+    labels = torch.tensor(labels, dtype=torch.long)
+    return texts, labels
+
+# Prepare data loaders
+train_data = [(process_data(text, label)) for label, text in IMDB(split='train')]
+test_data = [(process_data(text, label)) for label, text in IMDB(split='test')]
+
+train_loader = DataLoader(train_data, batch_size=32, shuffle=True, collate_fn=collate_batch)
+test_loader = DataLoader(test_data, batch_size=32, shuffle=False, collate_fn=collate_batch)
+
+# Define device, model, criterion, and optimizer
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+vocab_size = len(vocab)
+embed_dim = 64
+hidden_dim = 128
+output_dim = 2
+
+model = SentimentLSTM(vocab_size, embed_dim, hidden_dim, output_dim).to(device)
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(model.parameters(), lr=0.001)
+
+# Train the model
+def train(model, train_loader, optimizer, criterion, epochs=5):
+    model.train()
+    for epoch in range(epochs):
+        total_loss = 0
+        for texts, labels in train_loader:
+            texts, labels = texts.to(device), labels.to(device)
+            optimizer.zero_grad()
+            output = model(texts)
+            loss = criterion(output, labels)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+        print(f"Epoch {epoch + 1}/{epochs}, Loss: {total_loss:.4f}")
+
+# Test the model
+def test(model, test_loader):
+    model.eval()
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for texts, labels in test_loader:
+            texts, labels = texts.to(device), labels.to(device)
+            output = model(texts)
+            pred = output.argmax(dim=1)
+            correct += (pred == labels).sum().item()
+            total += labels.size(0)
+    print(f"Accuracy: {100 * correct / total:.2f}%")
+
+# AGU: Adaptive Gradient Unlearning Function
+def adaptive_gradient_unlearning(model, dataset_to_forget, optimizer, criterion, eta=0.01, delta=1e-4, max_iters=100):
+    model.train()
+    sensitivity_scores = {name: torch.zeros_like(param) for name, param in model.named_parameters()}
+
+    # Step 1: Compute sensitivity scores
+    for texts, labels in dataset_to_forget:
+        texts, labels = texts.to(device), labels.to(device)
+        optimizer.zero_grad()
+        output = model(texts)
+        loss = criterion(output, labels)
+        loss.backward()
+        for name, param in model.named_parameters():
+            if param.grad is not None:
+                sensitivity_scores[name] += param.grad ** 2
+
+    # Step 2: Normalize sensitivity scores
+    max_score = max(score.max() for score in sensitivity_scores.values())
+    for name in sensitivity_scores:
+        sensitivity_scores[name] /= max_score
+
+    # Step 3: Adaptive updates
+    for _ in range(max_iters):
+        converged = True
+        for texts, labels in dataset_to_forget:
+            texts, labels = texts.to(device), labels.to(device)
+            optimizer.zero_grad()
+            output = model(texts)
+            loss = criterion(output, labels)
+            loss.backward()
+            for name, param in model.named_parameters():
+                if param.grad is not None:
+                    update = eta * sensitivity_scores[name] * param.grad
+                    param.data -= update
+                    if torch.abs(update).max() > delta:
+                        converged = False
+        if converged:
+            break
+
+# Train and test before unlearning
+train(model, train_loader, optimizer, criterion, epochs=5)
+print("Before Unlearning:")
+test(model, test_loader)
+
+# Select dataset to unlearn (e.g., positive reviews)
+forget_dataset = [(text, label) for text, label in train_data if label == 1]
+forget_loader = DataLoader(forget_dataset, batch_size=32, collate_fn=collate_batch)
+
+# Apply AGU
+adaptive_gradient_unlearning(model, forget_loader, optimizer, criterion)
+
+# Test after unlearning
+print("After Unlearning:")
+test(model, test_loader)
